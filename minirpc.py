@@ -7,6 +7,9 @@ import functools
 class RPCException(Exception):
     pass
 
+class DecodeError(Exception):
+    pass
+
 class _Call:
     def __init__(self, func, *args, **kwargs):
         self.func = func
@@ -35,7 +38,7 @@ class PacketEncoder:
     @staticmethod
     def encode(object):
         data = pickle.dumps(object)
-        return struct.pack('!I', len(data)) + data
+        return struct.pack('!4sI', b"RPC!", len(data)) + data
 
 class PacketDecoder:
     def __init__(self):
@@ -48,13 +51,15 @@ class PacketDecoder:
         return self
 
     def __next__(self):
-        if len(self.data) < 4:
+        if len(self.data) < 8:
             raise StopIteration()
-        length = struct.unpack('!I', self.data[0:4])[0]
-        if len(self.data) < 4 + length:
+        sig, length = struct.unpack('!4sI', self.data[0:8])
+        if sig != b"RPC!":
+            raise DecodeError()
+        if len(self.data) < 8 + length:
             raise StopIteration()
-        object = self.data[4:4 + length]
-        self.data = self.data[4 + length:]
+        object = self.data[8:8 + length]
+        self.data = self.data[8 + length:]
         return pickle.loads(object)
 
 class RPCClient:
