@@ -7,6 +7,12 @@ import functools
 class RPCException(Exception):
     pass
 
+class RPCNotConnected(RPCException):
+    pass
+
+class RPCProtocolError(RPCException):
+    pass
+
 class DecodeError(Exception):
     pass
 
@@ -73,7 +79,7 @@ class RPCClient:
 
     def __getattr__(self, attr):
         if not self.__functable__:
-            raise RPCException("not connected")
+            raise RPCNotConnected("not connected")
         return self.__functable__[attr]
 
     async def __aenter__(self):
@@ -113,13 +119,13 @@ class RPCClient:
     async def call(self, func, *args, **kwargs):
         async with self.__lock:
             if not self.__functable__:
-                raise RPCException("not connected")
+                raise RPCNotConnected("not connected")
             self.writer.write(PacketEncoder.encode(_Call(func, *args, **kwargs)))
             while True:
                 data = await self.reader.read(0x1000)
                 if not data:
                     await self.disconnect()
-                    raise RPCException("protocol error")
+                    raise RPCProtocolError("protocol error")
                 self.decoder.push(data)
                 object = next(self.decoder, None)
                 if object is not None:
@@ -142,7 +148,7 @@ class RPCServer:
             data = await reader.read(0x1000)
             if not data:
                 if decoder.data:
-                    raise RPCException(f"{host}:{port}: protocol error")
+                    raise RPCProtocolError(f"{host}:{port}: protocol error")
                 break
             decoder.push(data)
             for object in decoder:
