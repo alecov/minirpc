@@ -77,16 +77,11 @@ class RPCClient:
         self.port = port
         self.args = args
         self.kwargs = kwargs
-        self.__functable__ = {}
+        self.__functable__ = None
         self.__lock = asyncio.Lock()
 
     def __getattr__(self, attr):
-        if not self.__functable__:
-            raise RPCNotConnected("not connected")
-        try:
-            return self.__functable__[attr]
-        except KeyError:
-            raise RPCMethodNotFound(f"method not found: {attr}")
+        return functools.partial(self.__call, attr)
 
     async def __aenter__(self):
         await self.connect()
@@ -109,8 +104,7 @@ class RPCClient:
                 funcs = next(self.decoder, None)
                 if funcs is not None:
                     break
-            for func in funcs:
-                self.__functable__[func] = functools.partial(self.__call, func)
+            self.__functable__ = funcs
 
     async def __call(self, *args, **kwargs):
         return await self.call(*args, **kwargs)
@@ -121,7 +115,7 @@ class RPCClient:
 
     async def poll(self):
         await self.writer.wait_closed()
-        self.__functable__ = {}
+        self.__functable__ = None
         self.reader = None
         self.writer = None
 
@@ -129,6 +123,8 @@ class RPCClient:
         async with self.__lock:
             if not self.__functable__:
                 raise RPCNotConnected("not connected")
+            if func not in self.__functable__:
+                raise RPCMethodNotFound(f"method not found: {func}")
             self.writer.write(PacketEncoder.encode(_Call(func, *args, **kwargs)))
             while True:
                 data = await self.reader.read(0x1000)
@@ -151,7 +147,7 @@ class RPCServer:
 
     async def serve(self, reader, writer):
         host, port = writer.transport.get_extra_info("peername")[0:2]
-        writer.write(PacketEncoder.encode(tuple(self.__functable__.keys())))
+        writer.write(PacketEncoder.encode(set(self.__functable__.keys())))
         decoder = PacketDecoder()
         while True:
             data = await reader.read(0x1000)
