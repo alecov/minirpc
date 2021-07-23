@@ -13,6 +13,9 @@ class RPCNotConnected(RPCException):
 class RPCProtocolError(RPCException):
     pass
 
+class RPCMethodNotFound(RPCException):
+    pass
+
 class DecodeError(Exception):
     pass
 
@@ -80,7 +83,10 @@ class RPCClient:
     def __getattr__(self, attr):
         if not self.__functable__:
             raise RPCNotConnected("not connected")
-        return self.__functable__[attr]
+        try:
+            return self.__functable__[attr]
+        except KeyError:
+            raise RPCMethodNotFound(f"method not found: {attr}")
 
     async def __aenter__(self):
         await self.connect()
@@ -104,7 +110,10 @@ class RPCClient:
                 if funcs is not None:
                     break
             for func in funcs:
-                self.__functable__[func] = functools.partial(self.call, func)
+                self.__functable__[func] = functools.partial(self.__call, func)
+
+    async def __call(self, *args, **kwargs):
+        return await self.call(*args, **kwargs)
 
     async def disconnect(self):
         self.writer.close()
