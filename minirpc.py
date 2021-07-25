@@ -20,12 +20,12 @@ class DecodeError(Exception):
     pass
 
 class _Call:
-    def __init__(self, func, *args, **kwargs):
-        self.func = func
+    def __init__(self, method, *args, **kwargs):
+        self.method = method
         self.args = args
         self.kwargs = kwargs
     def __repr__(self):
-        return f'{self.func}(*{self.args}, **{self.kwargs})'
+        return f'{self.method}(*{self.args}, **{self.kwargs})'
 
 class _Return:
     def __init__(self, object):
@@ -71,102 +71,171 @@ class PacketDecoder:
         self.data = self.data[8 + length:]
         return pickle.loads(object)
 
-class RPCClient:
-    def __init__(self, host, port, *args, **kwargs):
-        self.host = host
-        self.port = port
-        self.args = args
-        self.kwargs = kwargs
-        self.__functable__ = None
-        self.__lock = asyncio.Lock()
+class RPCProxy:
+    def __init__(self, client):
+        self.__dict__[0] = client
 
     def __getattr__(self, attr):
-        return functools.partial(self.__call, attr)
+        return functools.partial(self.__dict__[0].call, attr)
+
+class RPCClient:
+    def __init__(self, *args, **kwargs):
+        self._method = None
+        self._reader = None
+        self._writer = None
+        self._decoder = None
+        self._args = args
+        self._kwargs = kwargs
 
     async def __aenter__(self):
-        await self.connect()
-        return self
+        return await self.connect()
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.disconnect()
 
     async def connect(self):
-        async with self.__lock:
-            self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port, *self.args, **self.kwargs)
-            self.decoder = PacketDecoder()
+        if self._writer is not None:
+            return RPCProxy(self)
+        try:
+            self._reader, self._writer = \
+                await asyncio.open_connection(*self._args, **self._kwargs)
+            self._decoder = PacketDecoder()
             while True:
-                data = await self.reader.read(0x1000)
+                data = await self._reader.read(0x10000)
                 if not data:
-                    await self.disconnect()
+                    await RPCClient.disconnect(self)
                     raise RPCException("protocol error")
-                self.decoder.push(data)
-                funcs = next(self.decoder, None)
-                if funcs is not None:
+                self._decoder.push(data)
+                method = next(self._decoder, None)
+                if method is not None:
                     break
-            self.__functable__ = funcs
-
-    async def __call(self, *args, **kwargs):
-        return await self.call(*args, **kwargs)
+            self._method = method
+            return RPCProxy(self)
+        except Exception:
+            if self._writer is not None:
+                await RPCClient.disconnect(self)
+            raise
 
     async def disconnect(self):
-        self.writer.close()
-        await self.poll()
+        if self._writer is None:
+            return
+        self._writer.close()
+        await self._writer.wait_closed()
+        self._method = None
+        self._reader = None
+        self._writer = None
+        self._decoder = None
+
+    @property
+    def proxy(self):
+        return RPCProxy(self)
 
     async def poll(self):
-        await self.writer.wait_closed()
-        self.__functable__ = None
-        self.reader = None
-        self.writer = None
+        if self._writer is None:
+            return
+        await self._writer.wait_closed()
+        self._method = None
+        self._reader = None
+        self._writer = None
+        self._decoder = None
 
-    async def call(self, func, *args, **kwargs):
-        async with self.__lock:
-            if not self.__functable__:
-                raise RPCNotConnected("not connected")
-            if func not in self.__functable__:
-                raise RPCMethodNotFound(f"method not found: {func}")
-            self.writer.write(PacketEncoder.encode(_Call(func, *args, **kwargs)))
+    async def call(self, method, *args, **kwargs):
+        if self._writer is None:
+            raise RPCNotConnected("not connected")
+        if method not in self._method:
+            raise RPCMethodNotFound(f"method not found: {method}")
+        try:
+            self._writer.write(PacketEncoder.encode
+                (_Call(method, *args, **kwargs)))
             while True:
-                data = await self.reader.read(0x1000)
+                data = await self._reader.read(0x10000)
                 if not data:
-                    await self.disconnect()
+                    await RPCClient.disconnect(self)
                     raise RPCProtocolError("protocol error")
-                self.decoder.push(data)
-                object = next(self.decoder, None)
-                if object is not None:
+                self._decoder.push(data)
+                result = next(self._decoder, None)
+                if result is not None:
                     break
-        return object.value()
+        except Exception:
+            await RPCClient.disconnect(self)
+            raise
+        return result.value()
 
 class RPCServer:
     def __init__(self, logger=logging.getLogger(__name__)):
         self.logger = logger
-        self.__functable__ = {}
+        self._method = {}
 
-    def call(self, func):
-        self.__functable__[func.__name__] = func
+    def method(self, method):
+        self._method[method.__name__] = method
+        return method
 
     async def serve(self, reader, writer):
         host, port = writer.transport.get_extra_info("peername")[0:2]
-        writer.write(PacketEncoder.encode(set(self.__functable__.keys())))
+        writer.write(PacketEncoder.encode(set(self._method.keys())))
         decoder = PacketDecoder()
         while True:
-            data = await reader.read(0x1000)
+            data = await reader.read(0x10000)
             if not data:
                 if decoder.data:
                     raise RPCProtocolError(f"{host}:{port}: protocol error")
                 break
             decoder.push(data)
-            for object in decoder:
+            for call in decoder:
                 try:
-                    func = object.func
-                    args = object.args
-                    kwargs = object.kwargs
-                    _return = await self.__functable__[func](*args, **kwargs)
-                    writer.write(PacketEncoder.encode(_Return(_return)))
-                except Exception as _exception:
-                    self.logger.exception(f"{host}:{port}: In RPC call {object}:")
-                    writer.write(PacketEncoder.encode(_Exception(_exception)))
+                    method = call.method
+                    args = call.args
+                    kwargs = call.kwargs
+                    result = await self._method[method](*args, **kwargs)
+                    writer.write(PacketEncoder.encode(_Return(result)))
+                except Exception as result:
+                    self.logger.exception(f"{host}:{port}: In RPC call {call}:")
+                    writer.write(PacketEncoder.encode(_Exception(result)))
 
     async def run(self, host="localhost", port=10000, *args, **kwargs):
         server = await asyncio.start_server(self.serve, host, port, *args, **kwargs)
         await server.serve_forever()
+
+class AsyncSafeRPCClient(RPCClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lock = asyncio.Lock()
+
+    async def connect(self):
+        async with self.lock:
+            return await super().connect()
+
+    async def disconnect(self):
+        async with self.lock:
+            return await super().disconnect()
+
+    async def poll(self):
+        if self._writer is None:
+            return
+        while True:
+            writer = self._writer
+            await self._writer.wait_closed()
+            if writer is not self._writer:
+                continue
+            if self._writer.is_closing():
+                break
+        self._method = None
+        self._reader = None
+        self._writer = None
+        self._decoder = None
+
+    async def call(self, method, *args, **kwargs):
+        async with self.lock:
+            return await super().call(method, *args, **kwargs)
+
+class AsyncSafeRPCServer(RPCServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lock = asyncio.Lock()
+
+    def method(self, method):
+        async def locked(*args, **kwargs):
+            async with self.lock:
+                return await method(*args, **kwargs)
+        self._method[method.__name__] = locked
+        return locked

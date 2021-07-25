@@ -5,11 +5,11 @@ from minirpc import RPCServer
 
 server = RPCServer()
 
-@server.call
+@server.method
 async def echo(*args, **kwargs):
     return (args, kwargs)
 
-@server.call
+@server.method
 async def _raise(exception):
     raise exception
 
