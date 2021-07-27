@@ -84,8 +84,8 @@ class RPCClient:
         self._reader = None
         self._writer = None
         self._decoder = None
-        self._args = args
-        self._kwargs = kwargs
+        self.__args = args
+        self.__kwargs = kwargs
 
     async def __aenter__(self):
         return await self.connect()
@@ -93,12 +93,20 @@ class RPCClient:
     async def __aexit__(self, exc_type, exc, tb):
         await self.disconnect()
 
+    @property
+    def host(self):
+        return self.__kwargs.get("host", self.__args[0])
+
+    @property
+    def port(self):
+        return self.__kwargs.get("port", self.__args[1])
+
     async def connect(self):
         if self._writer is not None:
             return RPCProxy(self)
         try:
             self._reader, self._writer = \
-                await asyncio.open_connection(*self._args, **self._kwargs)
+                await asyncio.open_connection(*self.__args, **self.__kwargs)
             self._decoder = PacketDecoder()
             while True:
                 data = await self._reader.read(0x10000)
